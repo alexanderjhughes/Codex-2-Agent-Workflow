@@ -42,19 +42,18 @@ while SPEC="$(pick_next_spec)"; [[ -n "${SPEC:-}" ]]; do
       echo "BRANCH=$(git branch --show-current)"
     } >>"$LOG"
 
-    WORKER_PROMPT=$(
-      cat <<EOF
+    WORKER_PROMPT="$(cat <<'EOF'
 You are the "worker" Codex agent doing the coding.
 
 MUST READ FIRST:
 - AGENTS.md (both the project level and user level if they exist)
-- Spec: $SPEC
-- Progress: $PROG (if empty, create it and start step 1)
+- Spec: __SPEC__
+- Progress: __PROG__ (if empty, create it and start step 1)
 
 Rules:
 - Follow the spec strictly.
 - Do not refactor code unless explicitly instructed in the spec.
-- After EACH step, append to $PROG:
+- After EACH step, append to __PROG__:
   1) What you did
   2) Caveats/workarounds
   3) Open items to revisit
@@ -62,12 +61,16 @@ Rules:
 - Keep your response short and action-oriented. Prefer updating files over long explanations.
 
 The last response from you was:
-$LAST_W
+__LAST_W__
 
 Your project manager responded with:
-$LAST_PM
+__LAST_PM__
 EOF
-    )
+    )"
+    WORKER_PROMPT="${WORKER_PROMPT//__SPEC__/$SPEC}"
+    WORKER_PROMPT="${WORKER_PROMPT//__PROG__/$PROG}"
+    WORKER_PROMPT="${WORKER_PROMPT//__LAST_W__/$LAST_W}"
+    WORKER_PROMPT="${WORKER_PROMPT//__LAST_PM__/$LAST_PM}"
 
     TMP_W="$(mktemp)"
     { echo "--- WORKER PROMPT ---"; echo "$WORKER_PROMPT"; } >>"$LOG"
