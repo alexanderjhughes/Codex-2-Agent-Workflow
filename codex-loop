@@ -26,6 +26,8 @@ pick_next_spec() { ls -1 specs/*.md 2>/dev/null | grep -v '^specs/completed/' | 
 
 warn() { printf '\033[33mWARN:\033[0m %s\n' "$*"; }
 err() { printf '\033[31mERROR:\033[0m %s\n' "$*"; }
+iso_timestamp() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+iso_date() { date +"%Y-%m-%d"; }
 
 ANY_SPEC=false
 
@@ -37,7 +39,7 @@ while SPEC="$(pick_next_spec)"; [[ -n "${SPEC:-}" ]]; do
 
   while :; do
     {
-      echo "===== $(date -Is) ====="
+      echo "===== $(iso_timestamp) ====="
       echo "SPEC=$SPEC"
       echo "BRANCH=$(git branch --show-current)"
     } >>"$LOG"
@@ -125,7 +127,7 @@ EOF
     if [[ "$DONE" == "true" ]]; then
       {
         echo ""
-        echo "## ${BASE} ($(date -I))"
+        echo "## ${BASE} ($(iso_date))"
         echo ""
         echo "**Summary:** $SUM"
         echo ""
