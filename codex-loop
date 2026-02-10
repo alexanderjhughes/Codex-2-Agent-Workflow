@@ -1,0 +1,166 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+BRANCH="${1:?usage: $0 <branch-name>}"
+LOG="${CODEX_LOG_FILE:-codex-iteration.log}"
+WORKER_MODEL="${WORKER_MODEL:-gpt-5-codex}"
+PM_MODEL="${PM_MODEL:-gpt-5-codex-mini}"
+
+git rev-parse --is-inside-work-tree >/dev/null
+git checkout -b "$BRANCH" 2>/dev/null || git checkout "$BRANCH"
+mkdir -p specs/progress specs/completed
+touch "$LOG" specs/completed/featuresCompletedLog.md
+
+SCHEMA="$(mktemp)"; cat >"$SCHEMA"<<'JSON'
+{"type":"object","properties":{
+ "done":{"type":"boolean"},
+ "commit_type":{"type":"string","enum":["feat","fix"]},
+ "commit_msg":{"type":"string"},
+ "next_instruction":{"type":"string"},
+ "completion_summary":{"type":"string"},
+ "caveats_todos":{"type":"string"}
+},"required":["done","commit_type","commit_msg","next_instruction","completion_summary","caveats_todos"],"additionalProperties":false}
+JSON
+
+pick_next_spec() { ls -1 specs/*.md 2>/dev/null | grep -v '^specs/completed/' | head -n1 || true; }
+
+warn() { printf '\033[33mWARN:\033[0m %s\n' "$*"; }
+err() { printf '\033[31mERROR:\033[0m %s\n' "$*"; }
+
+ANY_SPEC=false
+
+while SPEC="$(pick_next_spec)"; [[ -n "${SPEC:-}" ]]; do
+  ANY_SPEC=true
+  BASE="$(basename "$SPEC" .md)"
+  PROG="specs/progress/${BASE}Progress.md"; touch "$PROG"
+  LAST_W=""; LAST_PM="(none yet)"
+
+  while :; do
+    {
+      echo "===== $(date -Is) ====="
+      echo "SPEC=$SPEC"
+      echo "BRANCH=$(git branch --show-current)"
+    } >>"$LOG"
+
+    WORKER_PROMPT=$(
+      cat <<EOF
+You are the "worker" Codex agent doing the coding.
+
+MUST READ FIRST:
+- AGENTS.md (both the project level and user level if they exist)
+- Spec: $SPEC
+- Progress: $PROG (if empty, create it and start step 1)
+
+Rules:
+- Follow the spec strictly.
+- Do not refactor code unless explicitly instructed in the spec.
+- After EACH step, append to $PROG:
+  1) What you did
+  2) Caveats/workarounds
+  3) Open items to revisit
+  4) What went well/reusable themes
+- Keep your response short and action-oriented. Prefer updating files over long explanations.
+
+The last response from you was:
+$LAST_W
+
+Your project manager responded with:
+$LAST_PM
+EOF
+    )
+
+    TMP_W="$(mktemp)"
+    { echo "--- WORKER PROMPT ---"; echo "$WORKER_PROMPT"; } >>"$LOG"
+    codex exec --full-auto --sandbox workspace-write --json -m "$WORKER_MODEL" -o "$TMP_W" -C . - <<<"$WORKER_PROMPT" 2>&1 | tee -a "$LOG" >/dev/null
+    LAST_W="$(cat "$TMP_W")"
+
+    CHANGED="$(git status --porcelain || true)"
+    { echo "--- FILE CHANGES (git status --porcelain) ---"; echo "${CHANGED:-<none>}"; } >>"$LOG"
+
+    TMP_PM="$(mktemp)"
+    PM_PROMPT=$(
+      cat <<EOF
+You are the "project manager". Decide the next action with minimal context.
+
+Inputs:
+- AGENTS.md (both the project level and user level if they exist)
+- Spec: $SPEC
+- Progress (tail): 
+$(tail -n 60 "$PROG" 2>/dev/null || true)
+
+- Worker last message:
+$LAST_W
+
+- Current git status --porcelain:
+$CHANGED
+
+Output MUST match the JSON schema. Decide:
+- done: true iff spec is fully complete.
+- commit_type: feat or fix
+- commit_msg: short imperative summary
+- next_instruction: what the worker should do next (or "Start next spec" if done)
+- completion_summary: high-level summary (for featuresCompletedLog.md)
+- caveats_todos: caveats/open todos (for featuresCompletedLog.md)
+EOF
+    )
+
+    { echo "--- PM PROMPT ---"; echo "$PM_PROMPT"; } >>"$LOG"
+    codex exec --json -m "$PM_MODEL" --output-schema "$SCHEMA" -o "$TMP_PM" -C . - <<<"$PM_PROMPT" 2>&1 | tee -a "$LOG" >/dev/null
+
+    DONE="$(jq -r '.done' <"$TMP_PM")"
+    TYPE="$(jq -r '.commit_type' <"$TMP_PM")"
+    MSG="$(jq -r '.commit_msg' <"$TMP_PM")"
+    LAST_PM="$(jq -r '.next_instruction' <"$TMP_PM")"
+    SUM="$(jq -r '.completion_summary' <"$TMP_PM")"
+    CAV="$(jq -r '.caveats_todos' <"$TMP_PM")"
+
+    if ! git diff --quiet || [[ -n "$CHANGED" ]]; then
+      git add -A
+      git commit -m "${TYPE}: ${MSG}" 2>&1 | tee -a "$LOG" >/dev/null || true
+    fi
+
+    if [[ "$DONE" == "true" ]]; then
+      {
+        echo ""
+        echo "## ${BASE} ($(date -I))"
+        echo ""
+        echo "**Summary:** $SUM"
+        echo ""
+        echo "**Caveats / Open todos:** $CAV"
+      } >> specs/completed/featuresCompletedLog.md
+      mv "$SPEC" "specs/completed/$(basename "$SPEC")"
+      echo "--- SPEC COMPLETED: moved $SPEC to specs/completed/ ---" >>"$LOG"
+      break
+    fi
+  done
+done
+
+if [[ "$ANY_SPEC" == "true" ]]; then
+  if ! command -v gh >/dev/null 2>&1; then
+    warn "gh CLI not found. PR was not created."
+    exit 1
+  fi
+
+  PR_TITLE="$BRANCH"
+  PR_BODY_FILE="$(mktemp)"
+  if [[ -f "PULL_REQUEST_TEMPLATE.md" ]]; then
+    cat "PULL_REQUEST_TEMPLATE.md" >"$PR_BODY_FILE"
+  else
+    cat >"$PR_BODY_FILE"<<EOF
+# ${PR_TITLE}
+
+This PR was created with the codex loop CLI tool.
+EOF
+  fi
+
+  if ! gh pr create -t "$PR_TITLE" -F "$PR_BODY_FILE"; then
+    err "Failed to create PR with gh."
+    exit 1
+  fi
+
+  if ! gh pr view --web >/dev/null 2>&1; then
+    warn "PR created, but failed to open in browser."
+  fi
+fi
+
+echo "No remaining specs/*.md. Done." | tee -a "$LOG"
